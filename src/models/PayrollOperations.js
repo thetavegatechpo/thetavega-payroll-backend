@@ -1,0 +1,15 @@
+import mongoose from 'mongoose';
+const {Schema}=mongoose;
+const ref={type:Schema.Types.ObjectId,ref:'Employee',required:true};
+const actor={type:Schema.Types.ObjectId,ref:'User'};
+const insurance=new Schema({employee:ref,amountPaise:{type:Number,required:true,min:0},effectiveFrom:{type:String,required:true},effectiveTo:String,active:{type:Boolean,default:true},updatedBy:actor},{timestamps:true});
+insurance.index({employee:1,effectiveFrom:1},{unique:true});
+export const EmployeeInsurance=mongoose.model('EmployeeInsurance',insurance,'employee_insurance');
+const advance=new Schema({employee:ref,amountPaise:{type:Number,required:true,min:1},date:{type:String,required:true},reason:String,reference:String,paid:{type:Boolean,default:false},paidAt:Date,approvedBy:actor,createdBy:actor},{timestamps:true});
+export const EmployeeAdvance=mongoose.model('EmployeeAdvance',advance,'employee_advances');
+const recovery=new Schema({advance:{type:Schema.Types.ObjectId,ref:'EmployeeAdvance',required:true},employee:ref,year:{type:Number,required:true},month:{type:Number,required:true},amountPaise:{type:Number,required:true,min:1},status:{type:String,enum:['PENDING','APPROVED','REJECTED'],default:'PENDING'},approvedBy:actor,approvedAt:Date,createdBy:actor},{timestamps:true});
+recovery.index({advance:1,year:1,month:1},{unique:true});
+export const AdvanceRecovery=mongoose.model('AdvanceRecovery',recovery,'advance_recoveries');
+const operation=new Schema({employee:ref,type:{type:String,required:true,enum:['TA_FIXED','TA_ACTUAL','OUTSTATION','SITE_LATE','EARLY_LEAVE','OVERTIME']},date:{type:String,required:true},tripId:String,site:String,siteId:{type:Schema.Types.ObjectId,ref:"Site"},department:String,description:String,checkInLatitude:Number,checkInLongitude:Number,checkOutLatitude:Number,checkOutLongitude:Number,scheduledTime:String,checkIn:String,checkOut:String,reason:String,amountPaise:{type:Number,default:0,min:0},hours:{type:Number,default:0,min:0},status:{type:String,enum:['PENDING','APPROVED','REJECTED'],default:'PENDING'},approvedBy:actor,approvedAt:Date,createdBy:actor,paid:{type:Boolean,default:false},paidAt:Date,paymentReference:String},{timestamps:true});
+operation.index({employee:1,type:1,date:1},{unique:true});
+export const PayrollOperation=mongoose.model('PayrollOperation',operation,'payroll_operations');
