@@ -15,7 +15,9 @@ const eligibility = new Schema(
     pf: { type: Boolean, default: false },
     esic: { type: Boolean, default: false },
     pt: { type: Boolean, default: false },
+    insurance: { type: Boolean, default: false },
     tds: { type: Boolean, default: false },
+    tdsPercent: { type: Number, default: 0, min: 0, max: 100 },
     tdsAmountPaise: {
       type: Number,
       default: 0,
@@ -68,11 +70,16 @@ const policy = new Schema(
       default: 21000,
     },
 
+    insuranceAmount: { type: Number, default: 0, min: 0 },
+    outstationFreeDays: { type: Number, default: 3, min: 0, max: 31 },
+    outstationGrossPercent: { type: Number, default: 20, min: 0, max: 100 },
     ptAmount: {
       type: Number,
       default: 200,
     },
 
+    earlyLeaveFreeCount: { type: Number, default: 2, min: 0 },
+    earlyLeavePenaltyPercent: { type: Number, default: 25, min: 0, max: 100 },
     casualLeaveAccrual: {
       type: Number,
       default: 1,

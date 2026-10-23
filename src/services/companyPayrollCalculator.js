@@ -14,7 +14,10 @@ export function calculateCompanyPayroll({
   policy,
   eligibility,
   approvedOvertimeAmount = 0,
-  approvedTdsAmount = 0
+  approvedTdsAmount = 0,
+  gender = "",
+  earlyLeaveCount = 0,
+  insuranceAmount = 0
 }) {
   const calendarDays = new Date(year, month, 0).getDate();
 
@@ -80,20 +83,30 @@ export function calculateCompanyPayroll({
   const employeeEsic = D(0);
   const employerEsic = D(0);
 
-  const pt = eligibility.ptApplicable
-    ? D(policy.ptAmount)
-    : D(0);
+  const normalizedGender = String(gender).trim().toUpperCase();
+  if (eligibility.ptApplicable && !["MALE","FEMALE"].includes(normalizedGender)) throw new Error("Gender required for Maharashtra PT");
+  const ptWages = earnedGross.toNumber();
+  const pt = eligibility.ptApplicable ? D(normalizedGender === "MALE"
+    ? (ptWages <= 7500 ? 0 : ptWages <= 10000 ? 175 : month === 2 ? 300 : 200)
+    : (ptWages <= 25000 ? 0 : month === 2 ? 300 : 200)) : D(0);
 
-  const tds = eligibility.tdsApplicable
-    ? D(approvedTdsAmount)
-    : D(0);
+  const tdsRate = Number(eligibility.tdsPercent ?? 0);
+  if (!Number.isFinite(tdsRate) || tdsRate < 0 || tdsRate > 100) throw new Error("Invalid TDS percentage");
+  const tds = eligibility.tdsApplicable ? earnedGross.mul(tdsRate).div(100) : D(0);
+  if (!Number.isInteger(earlyLeaveCount) || earlyLeaveCount < 0) throw new Error("Invalid early leave count");
+  const earlyPenalty = gross.div(calendarDays)
+    .mul(Math.max(0,earlyLeaveCount-Number(policy.earlyLeaveFreeCount ?? 2)))
+    .mul(Number(policy.earlyLeavePenaltyPercent ?? 25)).div(100);
+  const insurance = normalizedGender === "MALE" ? D(insuranceAmount) : D(0);
 
   const overtime = D(approvedOvertimeAmount);
 
   const deductions = D(money(employeePf))
     .plus(money(employeeEsic))
     .plus(money(pt))
-    .plus(money(tds));
+    .plus(money(tds))
+    .plus(money(earlyPenalty))
+    .plus(money(insurance));
 
   const salaryPayable = D(money(earnedGross))
     .plus(money(overtime));
@@ -123,6 +136,8 @@ export function calculateCompanyPayroll({
       employeeEsic: money(employeeEsic),
       pt: money(pt),
       tds: money(tds),
+      earlyLeave: money(earlyPenalty),
+      insurance: money(insurance),
       total: money(deductions)
     },
     employerCosts: {

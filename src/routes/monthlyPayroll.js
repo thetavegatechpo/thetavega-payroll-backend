@@ -1,3 +1,4 @@
+import {EmployeeInsurance,AdvanceRecovery,PayrollOperation} from "../models/PayrollOperations.js";
 
 import { Router } from "express";
 import { z } from "zod";
@@ -52,6 +53,18 @@ async function ensureEmployeeWritable(year, month, employeeId) {
   }
 }
 
+// Apply one paid CL against an existing leave day only after at least
+// 20 equivalent days of attendance, counting two half-days as one day.
+function grantEligibleCasualLeave(a) {
+  const worked = Number(a.presentDays || 0) - Number(a.halfDays || 0) * 0.5;
+  const alreadyPaid = Number(a.casualLeaveDays || 0);
+  const unpaid = Number(a.unpaidLeaveDays || 0);
+  if (worked >= 20 && alreadyPaid === 0 &&
+      Number(a.paidLeaveDays || 0) === 0 && unpaid >= 1) {
+    return {...a,casualLeaveDays:1,paidLeaveDays:1,unpaidLeaveDays:unpaid-1};
+  }
+  return a;
+}
 function attendanceCalc(a, calendarDays) {
   const presentDays = Number(a.presentDays || 0);
   const paidLeaveDays = Number(a.paidLeaveDays || 0);
@@ -60,13 +73,14 @@ function attendanceCalc(a, calendarDays) {
   const weeklyOffDays = Number(a.weeklyOffDays || 0);
   const holidayDays = Number(a.holidayDays || 0);
   const lateMarks = Number(a.lateMarks || 0);
+  const earlyLeaves = Number(a.earlyLeaves || 0);
   const approvedOverDays = Number(a.approvedOverDays || 0);
   const halfDays = Number(a.halfDays || 0);
 
   const inputs = [
     presentDays, paidLeaveDays, unpaidLeaveDays,
     casualLeaveDays, weeklyOffDays, holidayDays,
-    lateMarks, halfDays, approvedOverDays,
+    lateMarks, earlyLeaves, halfDays, approvedOverDays,
   ];
 
   if (inputs.some(v => !Number.isFinite(v) || v < 0)) {
@@ -80,6 +94,9 @@ function attendanceCalc(a, calendarDays) {
   if (!Number.isInteger(lateMarks)) {
     throw fail("Late marks must be whole numbers");
   }
+  if (!Number.isInteger(earlyLeaves) || earlyLeaves > presentDays - halfDays) {
+    throw fail("Early leaves must be a whole number no greater than full attendance days (excluding half-days)");
+  }
 
   const allocated =
     presentDays + paidLeaveDays + unpaidLeaveDays +
@@ -92,6 +109,28 @@ function attendanceCalc(a, calendarDays) {
   if (paidLeaveDays !== casualLeaveDays) {
     throw fail("Paid leave must equal casual leave");
   }
+  
+  // ============================================
+  // CASUAL LEAVE ELIGIBILITY VALIDATION
+  // Minimum 20 actual working days = 1 paid CL
+  // ============================================
+
+  const actualWorkedDays = presentDays - (halfDays * 0.5);
+
+  const allowedCasualLeave =
+    actualWorkedDays >= 20 ? 1 : 0;
+
+  if (!Number.isInteger(casualLeaveDays) || !Number.isInteger(paidLeaveDays)) {
+    throw fail("Casual leave must be either 0 or 1 whole day");
+  }
+  if (casualLeaveDays > allowedCasualLeave) {
+    throw fail(
+      actualWorkedDays < 20
+        ? `Casual Leave not allowed. Employee worked only ${actualWorkedDays} days. Minimum 20 working days required.`
+        : "Maximum 1 paid Casual Leave is allowed per month."
+    );
+  }
+ 
 
   const latePenaltyDays = lateMarks * 0.25;
   const halfDayPenaltyDays = halfDays * 0.5;
@@ -122,10 +161,13 @@ function attendanceCalc(a, calendarDays) {
     paidLeaveDays,
     unpaidLeaveDays,
     casualLeaveDays,
+    casualLeaveEligible: actualWorkedDays >= 20,
+    workedEquivalentDays: actualWorkedDays,
     totalLeaves: paidLeaveDays + unpaidLeaveDays,
     weeklyOffDays,
     holidayDays,
     lateMarks,
+    earlyLeaves,
     halfDays,
     halfDayPenaltyDays,
     latePenaltyDays,
@@ -160,6 +202,7 @@ router.put(
       weeklyOffDays: z.number().finite().min(0).default(0),
       holidayDays: z.number().finite().min(0).default(0),
       lateMarks: z.number().int().min(0).default(0),
+      earlyLeaves: z.number().int().min(0).default(0),
       halfDays: z.number().int().min(0).default(0),
       approvedOverDays: z.number().finite().min(0).max(31).default(0),
       notes: z.string().max(500).optional(),
@@ -178,6 +221,10 @@ router.put(
       return res.status(404).json({ message: "Employee not found" });
     }
 
+    // One paid CL is applied to an existing leave day after 20 equivalent
+    // days actually worked (two half-days count as one). Never create an
+    // extra attendance day or overwrite a locked employee payroll.
+    Object.assign(data, grantEligibleCasualLeave(data));
     const calculation = attendanceCalc(
       data,
       daysOf(data.year, data.month)
@@ -368,7 +415,8 @@ const policy = await PayrollPolicy.findOne({
 
       let a;
       try {
-        a = attendanceCalc(attendance, calendarDays);
+        const normalizedAttendance = grantEligibleCasualLeave(attendance);
+        a = attendanceCalc(normalizedAttendance, calendarDays);
       } catch (error) {
         skipped.push({
           employeeCode: employee.employeeCode,
@@ -460,38 +508,50 @@ const policy = await PayrollPolicy.findOne({
       // earnings rather than inclusive CTC.
       const earnedGrossPaise = sum(components);
 
-      // Employer ESIC is not automatically removed from
-      // CTC in this simplified structure. Flag ESIC-eligible
-      // cases until CTC allocation is properly configured.
+      // Employee ESI is a wage deduction; employer ESI is a separate CTC cost.
+      // Wage ceiling is checked against the full monthly wage, not attendance-prorated pay.
+      // Continued coverage during the contribution period must be established by HR eligibility.
       if (eligibility?.esic) {
-        skipped.push({
-          employeeCode: employee.employeeCode,
-          reason:
-            "ESIC-eligible CTC requires separate employer ESIC " +
-            "allocation before calculation",
-        });
-        continue;
+        const monthlyCtc = toPaise(salary.monthlyGross.toString());
+        if (monthlyCtc > toPaise(policy.esicWageCeiling)) {
+          skipped.push({employeeCode:employee.employeeCode,reason:'ESIC eligibility above the monthly ceiling requires HR verification of continued coverage'});
+          continue;
+        }
+        // Employer share is included in salary CTC, not deducted from employee's net.
+        const empRate = Number(policy.employerEsicRate)/100;
+        const employerEsic = Math.round(earnedGrossPaise * empRate/(1+empRate));
+        if (!other || other.amountPaise < employerEsic) {
+          skipped.push({employeeCode:employee.employeeCode,reason:'OTHER allowance insufficient for employer ESIC allocation'});
+          continue;
+        }
+        other.amountPaise -= employerEsic;
+        employerContributions.push({code:'EMPLOYER_ESIC',name:'Employer ESIC (included in CTC)',amountPaise:employerEsic});
+        const esicWagesPaise = sum(components);
+        const employeeEsic = Math.ceil(esicWagesPaise * Number(policy.employeeEsicRate)/100);
+        deductions.push({code:'ESIC',name:'Employee ESIC',amountPaise:employeeEsic});
       }
+      // Recompute gross after allocating employer ESI out of OTHER.
+      const finalEarnedGrossPaise = sum(components);
 
-      if (eligibility?.pt) {
-        deductions.push({
-          code: "PT",
-          name: "Professional Tax",
-          amountPaise: toPaise(policy.ptAmount),
-        });
+      // Requested company PT configuration. Validate state statutory obligations separately.
+      if (eligibility?.pt && String(employee.gender||'').trim().toUpperCase()==='MALE') {
+        const amountPaise=toPaise(policy.ptAmount ?? 200);
+        if(amountPaise)deductions.push({code:'PT',name:'Professional Tax',amountPaise});
       }
-
       if (eligibility?.tds) {
-        deductions.push({
-          code: "TDS",
-          name: "Approved TDS",
-          amountPaise: Number(eligibility.tdsAmountPaise || 0),
-        });
+        const rate = Number(eligibility.tdsPercent ?? 0);
+        if (!Number.isFinite(rate) || rate < 0 || rate > 100) {
+          skipped.push({employeeCode:employee.employeeCode,reason:"Invalid TDS percentage"});
+          continue;
+        }
+        // Gross-based configured withholding estimate; not a substitute for annual statutory TDS computation.
+        const amountPaise = Math.round(finalEarnedGrossPaise * rate / 100);
+        if (amountPaise) deductions.push({code:"TDS",name:`TDS (${rate}%)`,amountPaise});
       }
 
       const excluded = new Set([
         "PF", "EMPLOYER_PF", "ESIC",
-        "EMPLOYER_ESIC", "PT", "TDS",
+        "EMPLOYER_ESIC", "PT", "TDS", "INSURANCE", "ADVANCE_RECOVERY", "SITE_LATE", "EARLY_LEAVE",
       ]);
 
       for (const rule of rules) {
@@ -500,7 +560,7 @@ const policy = await PayrollPolicy.findOne({
         const amountPaise = rule.mode === "FIXED"
           ? toPaise(rule.value)
           : Math.round(
-              earnedGrossPaise * Number(rule.value) / 100
+              finalEarnedGrossPaise * Number(rule.value) / 100
             );
 
         deductions.push({
@@ -510,8 +570,71 @@ const policy = await PayrollPolicy.findOne({
         });
       }
 
+      // Additional approved operational records are additive to the existing
+      // salary/CTC logic. TA is deliberately excluded from payroll.
+      const periodStart = startOf(year, month);
+      const periodEnd = `${year}-${String(month).padStart(2, "0")}-${String(calendarDays).padStart(2, "0")}`;
+      const [insurance, recoveries, operations] = await Promise.all([
+        EmployeeInsurance.findOne({employee:employee._id,active:true,effectiveFrom:{$lte:periodEnd},$or:[{effectiveTo:null},{effectiveTo:{$exists:false}},{effectiveTo:{$gte:periodStart}}]}).sort({effectiveFrom:-1}).lean(),
+        AdvanceRecovery.find({employee:employee._id,year,month,status:"APPROVED"}).lean(),
+        PayrollOperation.find({employee:employee._id,date:{$gte:periodStart,$lte:periodEnd},status:"APPROVED"}).sort({date:1}).lean(),
+      ]);
+      const insurancePaise = insurance?.amountPaise ?? toPaise(policy.insuranceAmount ?? 0);
+      if (eligibility?.insurance && String(employee.gender || "").trim().toUpperCase() === "MALE" && insurancePaise > 0) deductions.push({code:"INSURANCE",name:"Employee insurance",amountPaise:insurancePaise});
+      const advancePaise = recoveries.reduce((v,r)=>v+r.amountPaise,0);
+      if (advancePaise) deductions.push({code:"ADVANCE_RECOVERY",name:"Approved advance recovery",amountPaise:advancePaise});
+      // OT starts after 20:00; rate = monthly BASIC / (26 x 8), 1x.
+      // An explicit hours value is required, with an approved site record.
+      const monthlyBasicPaise = salary.items.filter(i=>String(i.code).toUpperCase()==="BASIC").reduce((v,i)=>v+toPaise(i.amount.toString()),0);
+      if(a.approvedOverDays>0 && operations.some(o=>o.type==="OVERTIME")){
+        skipped.push({employeeCode:employee.employeeCode,reason:"Both legacy overtime days and hourly overtime exist; resolve duplicate overtime before calculating"});
+        continue;
+      }
+      const overtimePaise = operations.filter(o=>o.type==="OVERTIME").reduce((v,o)=>v+Math.round(monthlyBasicPaise*o.hours/(26*8)),0);
+      // Eligible days are counted per trip, including earlier months.
+      // Sundays never count toward the first four eligible days or allowance.
+      const tripIds = [...new Set(operations.filter(o=>o.type==="OUTSTATION").map(o=>o.tripId).filter(Boolean))];
+      const historicalTripDays = tripIds.length ? await PayrollOperation.find({employee:employee._id,type:"OUTSTATION",status:"APPROVED",tripId:{$in:tripIds},date:{$lte:periodEnd}}).sort({date:1}).lean() : [];
+      const tripDayRanks = new Map();
+      const eligibleTripDays = new Set();
+      for(const o of historicalTripDays){
+        if(new Date(o.date+"T00:00:00Z").getUTCDay()===0)continue;
+        const n=(tripDayRanks.get(o.tripId)||0)+1;
+        tripDayRanks.set(o.tripId,n);
+        if(n>Number(policy.outstationFreeDays ?? 3))eligibleTripDays.add(String(o._id));
+      }
+      const outstationCount = operations.filter(o=>o.type==="OUTSTATION"&&eligibleTripDays.has(String(o._id))).length;
+      const monthlyCtcPaise = toPaise(salary.monthlyGross.toString());
+      const monthlyEmployerPfPaise = eligibility?.pf ? Math.round(monthlyBasicPaise*Number(policy.employerPfRate)/100) : 0;
+      const monthlyEmployerEsicPaise = employerContributions.filter(x=>x.code==="EMPLOYER_ESIC").reduce((v,x)=>v+x.amountPaise,0);
+      // All per-day employee allowances and CL bonus use configured Monthly Gross,
+      // e.g. ₹31,000 / 31 days = ₹1,000. Employer costs are handled separately.
+      const monthlyGrossForOutstation = monthlyCtcPaise;
+      const outstationPaise = Math.round(outstationCount*(Number(policy.outstationGrossPercent ?? 20)/100)*monthlyGrossForOutstation/calendarDays);
+      // Manual monthly early-leave count and approved site operations represent the
+      // same category. Use the larger count, NEVER add both (prevents double penalty).
+      // Before-4PM checkouts already recorded as half-days must not be included.
+      const approvedEarlyCount = operations.filter(o=>o.type==="EARLY_LEAVE").length;
+      const earlyCount = Math.max(a.earlyLeaves, approvedEarlyCount);
+      const earlyPenaltyPaise = Math.round(Math.max(0,earlyCount-Number(policy.earlyLeaveFreeCount ?? 2))*(Number(policy.earlyLeavePenaltyPercent ?? 25)/100)*monthlyGrossForOutstation/calendarDays);
+      if(earlyPenaltyPaise) deductions.push({code:"EARLY_LEAVE",name:"Early-leave penalty",amountPaise:earlyPenaltyPaise});
+      const sitePenaltyPaise = operations.filter(o=>o.type==="SITE_LATE").reduce((v,o)=>v+o.amountPaise,0);
+      if(sitePenaltyPaise) deductions.push({code:"SITE_LATE",name:"Approved site late penalty",amountPaise:sitePenaltyPaise});
+      const cleanMonth = a.workedEquivalentDays >= 20 && a.unpaidLeaveDays===0 && a.paidLeaveDays===0 && a.halfDays===0 && a.lateMarks===0 && a.payableBeforeOvertime===calendarDays && earlyCount===0 && sitePenaltyPaise===0;
+      // The configured monthlyGross is inclusive CTC in this system. For the CL
+      // daily GROSS wage basis, exclude employer PF/ESIC embedded in that CTC.
+      // Employer ESIC is estimated at full-month wages, not prorated overtime.
+      const fullMonthEsicRate = eligibility?.esic ? Number(policy.employerEsicRate)/100 : 0;
+      const monthlyEmployerEsicForClPaise = fullMonthEsicRate > 0
+        ? Math.round(Math.max(0, monthlyCtcPaise-monthlyEmployerPfPaise)*fullMonthEsicRate/(1+fullMonthEsicRate)) : 0;
+      const monthlyEmployeeGrossPaise = Math.max(0, monthlyCtcPaise-monthlyEmployerPfPaise-monthlyEmployerEsicForClPaise);
+      const clBonusPaise = cleanMonth ? Math.round(monthlyEmployeeGrossPaise/calendarDays) : 0;
+      if(clBonusPaise)components.push({code:'CL_EXTRA_DAY',name:'Unused Casual Leave Payment',amountPaise:clBonusPaise});
+      if(overtimePaise)components.push({code:'OT_EARNING',name:'Approved overtime',amountPaise:overtimePaise});
+      if(outstationPaise)components.push({code:'OUTSTATION_ALLOWANCE',name:'Outstation allowance',amountPaise:outstationPaise});
+      const extraEarningsPaise = overtimePaise+outstationPaise+clBonusPaise;
       const totalDeductionPaise = sum(deductions);
-      const netPaise = earnedGrossPaise - totalDeductionPaise;
+      const netPaise = finalEarnedGrossPaise + extraEarningsPaise - totalDeductionPaise;
 
       if (netPaise < 0) {
         skipped.push({
@@ -540,14 +663,16 @@ const policy = await PayrollPolicy.findOne({
               `${employee.firstName} ${employee.lastName}`,
             calendarDays,
             payableDays: a.payableDays,
-            status: "DRAFT",
+            status: "APPROVED",
+            approvedBy: req.user._id || req.user.id,
+            approvedAt: new Date(),
 
             // This field retains the original monthly
             // budget; it is now interpreted as monthly CTC.
             monthlyGrossPaise: toPaise(salary.monthlyGross.toString()),
 
-            earnedGrossPaise,
-            overtimePaise: 0,
+            earnedGrossPaise: finalEarnedGrossPaise + extraEarningsPaise,
+            overtimePaise,
             components,
             deductions,
             employerContributions,
@@ -557,7 +682,10 @@ const policy = await PayrollPolicy.findOne({
             attendanceSnapshot: {
               ...attendance,
               ...a,
+              payableDaysWithClBonus: a.payableDays + (clBonusPaise>0?1:0),
               earnedCtcPaise,
+              operationalEarnings: {overtimePaise,outstationPaise,clBonusPaise},
+              operationalDeductions: {insurancePaise:eligibility?.insurance&&String(employee.gender||"").toUpperCase()==="MALE"?insurancePaise:0,advancePaise,earlyPenaltyPaise,sitePenaltyPaise},
             },
 
             policySnapshot: {
@@ -580,6 +708,7 @@ const policy = await PayrollPolicy.findOne({
         { upsert: !existingEntry, new: true, runValidators: true }
       );
       if (!updatedEntry) throw fail("Payroll status changed; refresh and retry",409);
+      await audit(req, "FINALIZE", "PayrollEntry", updatedEntry.id, null, {year,month,employeeId: String(employee._id), automatic: true});
       calculated++;
     }
 

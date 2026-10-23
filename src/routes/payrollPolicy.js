@@ -24,8 +24,9 @@ const eligible = z.object({
   pf: z.boolean(),
   esic: z.boolean(),
   pt: z.boolean(),
+  insurance: z.boolean().default(false),
   tds: z.boolean(),
-  tdsAmountPaise: z.number().int().min(0).default(0),
+  tdsPercent: z.number().finite().min(0).max(100).default(0),
 }).strict();
 
 // Get employee eligibility
@@ -43,8 +44,9 @@ router.get(
         pf: false,
         esic: false,
         pt: false,
+        insurance: false,
         tds: false,
-        tdsAmountPaise: 0,
+        tdsPercent: 0,
       }
     );
   })
@@ -100,8 +102,13 @@ const rule = z.object({
 
   esicWageCeiling: z.number().min(0),
   ptAmount: z.number().min(0),
+  insuranceAmount: z.number().min(0).default(0),
+  outstationFreeDays: z.number().int().min(0).max(31).default(3),
+  outstationGrossPercent: z.number().min(0).max(100).default(20),
 
   casualLeaveAccrual: z.number().min(0).max(31),
+  earlyLeaveFreeCount: z.number().int().min(0).max(31).default(2),
+  earlyLeavePenaltyPercent: z.number().min(0).max(100).default(25),
 
   lateMarksPerPenalty: z.number().int().min(1),
   latePenaltyDays: z.number().min(0).max(31),
