@@ -62,22 +62,22 @@ function buildBreakdown(entry) {
   const employeePfPaise = getAmountByCode(
     deductions,
     "PF"
-  );
+  ) || amount(entry.employeePfPaise);
 
   const employerPfPaise = getAmountByCode(
     employerContributions,
     "EMPLOYER_PF"
-  );
+  ) || amount(entry.employerPfPaise);
 
   const employeeEsicPaise = getAmountByCode(
     deductions,
     "ESIC"
-  );
+  ) || amount(entry.employeeEsicPaise);
 
   const employerEsicPaise = getAmountByCode(
     employerContributions,
     "EMPLOYER_ESIC"
-  );
+  ) || amount(entry.employerEsicPaise);
 
   const ptPaise = getAmountByCode(deductions, "PT");
   const tdsPaise = getAmountByCode(deductions, "TDS");
@@ -121,12 +121,21 @@ function buildBreakdown(entry) {
     totalEmployeeDeductionsPaise,
     totalEmployerContributionsPaise,
 
-    // Preserve approved take-home pay.
+      // Preserve approved take-home pay.
     netSalaryPaise,
 
     // Informational employer cost summary.
     grossPlusEmployerCostPaise:
       earnedGrossPaise + totalEmployerContributionsPaise,
+
+    // Company policy: all four contribution estimates
+    // calculated using Basic Salary.
+basicBasedContributions:
+  entry.policySnapshot?.basicBasedContributions ?? null,
+
+// Excel reconciliation only, not statutory salary deductions.
+excelCalculation:
+  entry.policySnapshot?.excelCalculation ?? null,
   };
 }
 
@@ -337,7 +346,13 @@ router.get(
         year: period.year,
         month: period.month,
 
-        entry,
+        entry: entry ? {
+          ...entry,
+          employeePfPaise: buildBreakdown(entry).employeePfPaise,
+          employerPfPaise: buildBreakdown(entry).employerPfPaise,
+          employeeEsicPaise: buildBreakdown(entry).employeeEsicPaise,
+          employerEsicPaise: buildBreakdown(entry).employerEsicPaise,
+        } : null,
 
         breakdown: entry
           ? buildBreakdown(entry)

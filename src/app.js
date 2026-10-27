@@ -1,3 +1,4 @@
+import mobilePayroll from "./routes/mobilePayroll.js";
 import sites from "./routes/sites.js";
 import payrollOperations from "./routes/payrollOperations.js";
 import company from "./routes/company.js";
@@ -20,6 +21,7 @@ app.use("/api/company",company);app.use("/api/users",users);app.use("/api/roles"
 app.use("/api/mobile/auth", mobileAuth);
 
 app.use("/api/mobile", mobileAttendance);
+app.use("/api/mobile/payroll", mobilePayroll);
 
 app.use(
   "/api/admin/site-attendance",

@@ -65,10 +65,7 @@ const policy = new Schema(
       default: 3.25,
     },
 
-    esicWageCeiling: {
-      type: Number,
-      default: 21000,
-    },
+   
 
     insuranceAmount: { type: Number, default: 0, min: 0 },
     outstationFreeDays: { type: Number, default: 3, min: 0, max: 31 },

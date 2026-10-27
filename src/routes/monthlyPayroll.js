@@ -30,6 +30,32 @@ const startOf = (y, m) => `${y}-${String(m).padStart(2, "0")}-01`;
 const daysOf = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
 const sum = (items) => items.reduce((s, x) => s + x.amountPaise, 0);
 
+// Only allowances explicitly approved by HR as CTC-adjustable may absorb
+// employer costs. By default, only OTHER is flexible (existing behavior).
+// Example after HR approval: CTC_ADJUSTABLE_COMPONENT_CODES=OTHER,CONVEYANCE,MEDICAL
+const adjustableCtcCodes = new Set(
+  (process.env.CTC_ADJUSTABLE_COMPONENT_CODES || "OTHER")
+    .split(",").map(code => code.trim().toUpperCase()).filter(Boolean)
+);
+// BASIC and statutory contributions must never be treated as flexible allowances.
+for (const code of ["BASIC", "PF", "ESIC", "EMPLOYER_PF", "EMPLOYER_ESIC", "PT", "TDS"]) {
+  adjustableCtcCodes.delete(code);
+}
+
+function allocateEmployerCtc(components, employerCostPaise) {
+  let outstanding = employerCostPaise;
+  const allocations = [];
+  for (const component of components) {
+    const code = String(component.code || "").toUpperCase();
+    if (!adjustableCtcCodes.has(code) || outstanding <= 0) continue;
+    const deducted = Math.min(outstanding, Math.max(0, component.amountPaise));
+    component.amountPaise -= deducted;
+    outstanding -= deducted;
+    if (deducted) allocations.push({ code, amountPaise: deducted });
+  }
+  return { outstanding, allocations };
+}
+
 const fail = (message, status = 400) =>
   Object.assign(new Error(message), { status });
 
@@ -445,6 +471,23 @@ const policy = await PayrollPolicy.findOne({
       const basic = components
         .filter(x => String(x.code).toUpperCase() === "BASIC")
         .reduce((s, x) => s + x.amountPaise, 0);
+      // Reference amounts only: these do not alter statutory deductions.
+      const basicBasedContributions = {
+        employeePfPaise: eligibility?.pf ? Math.round(basic * Number(policy.employeePfRate) / 100) : 0,
+        employerPfPaise: eligibility?.pf ? Math.round(basic * Number(policy.employerPfRate) / 100) : 0,
+        employeeEsicPaise: eligibility?.esic ? Math.round(basic * Number(policy.employeeEsicRate) / 100) : 0,
+        employerEsicPaise: eligibility?.esic ? Math.round(basic * Number(policy.employerEsicRate) / 100) : 0,
+      };
+
+      // Excel comparison: earned CTC used as ESIC reference wage base.
+      // Employer shares remain employer costs, not employee wage deductions.
+      const excelCalculation = {
+        salaryToBeGivenPaise: earnedCtcPaise,
+        employeePfPaise: basicBasedContributions.employeePfPaise,
+        employerPfPaise: basicBasedContributions.employerPfPaise,
+        employeeEsicPaise: eligibility?.esic ? Math.round(earnedCtcPaise * Number(policy.employeeEsicRate) / 100) : 0,
+        employerEsicPaise: eligibility?.esic ? Math.round(earnedCtcPaise * Number(policy.employerEsicRate) / 100) : 0,
+      };
 
       const deductions = [];
       const employerContributions = [];
@@ -482,55 +525,42 @@ const policy = await PayrollPolicy.findOne({
         });
       }
 
-      // Reconcile the employer PF within CTC by adjusting
-      // the OTHER allowance, while keeping BASIC unchanged.
-      //
-      // Do not represent employer PF as a wage deduction.
-      const other = components.find(
-        x => String(x.code).toUpperCase() === "OTHER"
-      );
+      // Employer costs remain part of the agreed CTC, not employee deductions.
+      // Spreadsheet reconciliation uses the pre-allocation earned CTC as its
+      // ESIC percentage base. Before statutory filing, HR must verify that
+      // this amount is also the employee's legally applicable ESIC wages.
+      let employerEsic = 0;
+      let employeeEsic = 0;
+   if (eligibility?.esic) {
+  // ESIC applicability is determined through the
+  // employee's HR-maintained statutory eligibility record.
+  // Do not reject payroll based on monthly CTC.
 
-      if (employerPf > 0) {
-        if (!other || other.amountPaise < employerPf) {
-          skipped.push({
-            employeeCode: employee.employeeCode,
-            reason:
-              "OTHER allowance is insufficient to absorb employer PF. " +
-              "Review this employee's CTC structure.",
-          });
+  const empRate = Number(policy.employerEsicRate) / 100;
+        const employeeRate = Number(policy.employeeEsicRate) / 100;
+        if (![empRate, employeeRate].every(r => Number.isFinite(r) && r >= 0 && r <= 1)) {
+          skipped.push({ employeeCode: employee.employeeCode, reason: "Invalid ESIC policy rates" });
           continue;
         }
-
-        other.amountPaise -= employerPf;
+        // Excel calculation: salary to be given x employer ESIC percentage.
+        employerEsic = Math.round(earnedCtcPaise * empRate);
       }
-
-      // Components now reflect employee's actual gross
-      // earnings rather than inclusive CTC.
-      const earnedGrossPaise = sum(components);
-
-      // Employee ESI is a wage deduction; employer ESI is a separate CTC cost.
-      // Wage ceiling is checked against the full monthly wage, not attendance-prorated pay.
-      // Continued coverage during the contribution period must be established by HR eligibility.
+      const employerCtcCostPaise = employerPf + employerEsic;
+      const { outstanding, allocations: employerCtcAllocations } =
+        allocateEmployerCtc(components, employerCtcCostPaise);
+      if (outstanding > 0) {
+        skipped.push({ employeeCode: employee.employeeCode,
+          reason: `Insufficient HR-approved adjustable CTC allowances: ₹${(outstanding / 100).toFixed(2)} short for employer PF/ESIC. Review salary structure or approved adjustable allowance codes.` });
+        continue;
+      }
       if (eligibility?.esic) {
-        const monthlyCtc = toPaise(salary.monthlyGross.toString());
-        if (monthlyCtc > toPaise(policy.esicWageCeiling)) {
-          skipped.push({employeeCode:employee.employeeCode,reason:'ESIC eligibility above the monthly ceiling requires HR verification of continued coverage'});
-          continue;
-        }
-        // Employer share is included in salary CTC, not deducted from employee's net.
-        const empRate = Number(policy.employerEsicRate)/100;
-        const employerEsic = Math.round(earnedGrossPaise * empRate/(1+empRate));
-        if (!other || other.amountPaise < employerEsic) {
-          skipped.push({employeeCode:employee.employeeCode,reason:'OTHER allowance insufficient for employer ESIC allocation'});
-          continue;
-        }
-        other.amountPaise -= employerEsic;
-        employerContributions.push({code:'EMPLOYER_ESIC',name:'Employer ESIC (included in CTC)',amountPaise:employerEsic});
-        const esicWagesPaise = sum(components);
-        const employeeEsic = Math.ceil(esicWagesPaise * Number(policy.employeeEsicRate)/100);
-        deductions.push({code:'ESIC',name:'Employee ESIC',amountPaise:employeeEsic});
+        employerContributions.push({ code: "EMPLOYER_ESIC",
+          name: "Employer ESIC (included in CTC)", amountPaise: employerEsic });
+        // Excel calculation: salary to be given x employee ESIC percentage.
+        // Do not calculate on the gross AFTER employer CTC allocation.
+        employeeEsic = Math.round(earnedCtcPaise * Number(policy.employeeEsicRate) / 100);
+        deductions.push({ code: "ESIC", name: "Employee ESIC", amountPaise: employeeEsic });
       }
-      // Recompute gross after allocating employer ESI out of OTHER.
       const finalEarnedGrossPaise = sum(components);
 
       // Requested company PT configuration. Validate state statutory obligations separately.
@@ -676,6 +706,10 @@ const policy = await PayrollPolicy.findOne({
             components,
             deductions,
             employerContributions,
+            employeePfPaise: deductions.filter(x=>x.code==='PF').reduce((n,x)=>n+x.amountPaise,0),
+            employerPfPaise: employerContributions.filter(x=>x.code==='EMPLOYER_PF').reduce((n,x)=>n+x.amountPaise,0),
+            employeeEsicPaise: deductions.filter(x=>x.code==='ESIC').reduce((n,x)=>n+x.amountPaise,0),
+            employerEsicPaise: employerContributions.filter(x=>x.code==='EMPLOYER_ESIC').reduce((n,x)=>n+x.amountPaise,0),
             totalDeductionPaise,
             netPaise,
 
@@ -694,6 +728,8 @@ const policy = await PayrollPolicy.findOne({
               pfBasis: "BASIC",
               salaryBasis: "CTC_INCLUSIVE_EMPLOYER_PF",
               employerPfIncludedInCtc: true,
+              basicBasedContributions,
+              excelCalculation,
             },
 
             salaryRevision: salary.revision,

@@ -100,7 +100,6 @@ const rule = z.object({
   employeeEsicRate: z.number().min(0).max(100),
   employerEsicRate: z.number().min(0).max(100),
 
-  esicWageCeiling: z.number().min(0),
   ptAmount: z.number().min(0),
   insuranceAmount: z.number().min(0).default(0),
   outstationFreeDays: z.number().int().min(0).max(31).default(3),
@@ -124,6 +123,7 @@ router.get(
   permit("config:read"),
   wrap(async (req, res) => {
     const policies = await PayrollPolicy.find()
+      .select("-esicWageCeiling")
       .sort({ createdAt: -1, _id: -1 })
       .lean();
 
@@ -142,7 +142,10 @@ router.post(
       });
     }
 
-    const data = rule.parse(req.body);
+    // Accept and discard a legacy field until existing frontends stop sending it.
+    // The wage-ceiling setting is no longer part of the company policy payload.
+    const { esicWageCeiling: _legacyCeiling, ...policyInput } = req.body ?? {};
+    const data = rule.parse(policyInput);
 
     const doc = await PayrollPolicy.create(data);
 
